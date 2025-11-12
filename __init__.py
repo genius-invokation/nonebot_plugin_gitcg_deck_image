@@ -124,7 +124,9 @@ IMAGE_CACHE_DIR = "image_cache"
 if not os.path.exists(IMAGE_CACHE_DIR):
     os.makedirs(IMAGE_CACHE_DIR)
 
-async def fetch_image(session: aiohttp.ClientSession, card_id: int) -> Image.Image:
+async def fetch_image(session: aiohttp.ClientSession, card_id: int, fallback: Image.Image) -> Image.Image:
+    if not card_id or card_id == 0 or str(card_id).strip() in ("", "0"):
+        return fallback
     """
     异步获取单个卡牌图片，使用本地文件缓存。
     """
@@ -143,24 +145,19 @@ async def fetch_image(session: aiohttp.ClientSession, card_id: int) -> Image.Ima
             else:
                 # 如果下载失败，返回一个占位图
                 print(f"警告：无法下载卡牌图片 ID: {card_id}, 状态码: {response.status}")
-                return create_placeholder_image(140, 240, str(card_id))
+                return fallback
     except Exception as e:
         print(f"警告：下载图片时发生错误 ID: {card_id}, 错误: {e}")
-        return create_placeholder_image(140, 240, str(card_id))
+        return fallback
+def add_padding(img: Image.Image, padding: int = 4) -> Image.Image:
+    w, h = img.size
+    new_img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    new_img.paste(img.resize((w - 2 * padding, h - 2 * padding), Image.Resampling.LANCZOS), (padding, padding))
+    return new_img
 
-def create_placeholder_image(width, height, text):
-    """为下载失败的图片创建一个占位符"""
-    img = Image.new('RGB', (width, height), color = (128, 128, 128))
-    d = ImageDraw.Draw(img)
-    try:
-        # 尝试加载字体
-        from PIL import ImageFont
-        font = ImageFont.truetype("arial.ttf", 20)
-    except IOError:
-        font = None # 使用默认字体
-    d.text((10,10), f"Error\nID:{text}", fill=(255,255,0), font=font)
-    return img
-
+def apply_frame(base_img: Image.Image, frame: Image.Image) -> Image.Image:
+    base_img = base_img.convert("RGBA")
+    return Image.alpha_composite(base_img, frame)
 
 # --- 4 & 5. 核心逻辑：图片合成与输出 ---
 
@@ -168,47 +165,68 @@ async def generate_deck_image(b64_string: str) -> BytesIO:
     """
     主函数，整合所有步骤生成最终的牌组图片。
     """
+    placeholder = Image.open("assets/UI_Gcg_DeckShare_ImgEmpty.png").convert("RGBA")
+    bg = Image.open("assets/UI_Gcg_DeckShare_PhotoBg.png").convert("RGBA")
+    frame_normal = Image.open("assets/UI_Gcg_DeckShare_Frame3.png").convert("RGBA")
+    frame_esoteric = Image.open("assets/UI_Gcg_DeckShare_Frame3_Esoteric.png").convert("RGBA")
+
     # 步骤1 & 2 & 3
     id_map = await get_card_id_map()
     share_ids = decode_share_ids(b64_string)
+
+    placeholder_id = None  # 用于标记占位图
     card_ids = [id_map.get(sid, 0) for sid in share_ids]
-    card_ids = card_ids[:3] + sorted(card_ids[3:])  # 后30张 行动牌 id 升序
+    main_cards = [
+        cid if cid and len(str(cid)) >= 4 else placeholder_id
+        for cid in card_ids[:3]
+    ]
+    small_cards_valid = [cid for cid in card_ids[3:] if cid and len(str(cid)) >= 6]
+    small_cards_invalid = [placeholder_id for cid in card_ids[3:] if not cid or len(str(cid)) < 6]
+    # 合并，小图占位图排在末尾
+    card_ids = main_cards + sorted(small_cards_valid) + small_cards_invalid
 
     async with aiohttp.ClientSession() as session:
-        fetch_tasks = [fetch_image(session, cid) for cid in card_ids]
+        fetch_tasks = [fetch_image(session, cid, placeholder.copy()) for cid in card_ids]
         images = await asyncio.gather(*fetch_tasks)
 
     # 步骤4: 布局与绘制
     # 定义尺寸
-    W_LARGE, H_LARGE = 210, 360
-    W_SMALL, H_SMALL = 140, 240
-    PADDING = 20
+    W_LARGE, H_LARGE = 142, 232
+    W_SMALL, H_SMALL = 89, 144
+    PADDING = 16
 
-    # 计算画布尺寸
-    CANVAS_WIDTH = 2 * PADDING + 6 * W_SMALL + 5 * PADDING
-    CANVAS_HEIGHT = 2 * PADDING + H_LARGE + PADDING + 5 * H_SMALL + 4 * PADDING
-
-    canvas = Image.new('RGB', (CANVAS_WIDTH, CANVAS_HEIGHT), 'white')
+    canvas = bg.copy()
 
     # 绘制第一行（3张大图）
-    large_cards_row_width = 3 * W_LARGE + 2 * PADDING
-    start_x_large = (CANVAS_WIDTH - large_cards_row_width) // 2
+    start_x_large = (canvas.width - (3 * W_LARGE + 2 * PADDING)) // 2
     for i in range(3):
-        img_large = images[i].resize((W_LARGE, H_LARGE), Image.Resampling.LANCZOS)
+        cid = card_ids[i]
+        img = images[i].resize((W_LARGE, H_LARGE))
+
+        if cid is not None:
+            img = add_padding(img, padding=8)
+            frame = frame_esoteric if str(cid).startswith("3300") else frame_normal
+            img = apply_frame(img, frame.copy())
         x = start_x_large + i * (W_LARGE + PADDING)
-        y = PADDING
-        canvas.paste(img_large, (x, y))
+        y = 160
+        canvas.alpha_composite(img, (x, y))
 
     # 绘制后五行（5x6张小图）
     start_y_small_rows = PADDING + H_LARGE + PADDING
+    start_x_small = (canvas.width - (6 * W_SMALL + 5 * PADDING)) // 2
+    start_y_small = 170 + H_LARGE + 70
     for i in range(3, 33):
         row = (i - 3) // 6
         col = (i - 3) % 6
-
-        img_small = images[i].resize((W_SMALL, H_SMALL), Image.Resampling.LANCZOS)
-        x = PADDING + col * (W_SMALL + PADDING)
-        y = start_y_small_rows + row * (H_SMALL + PADDING)
-        canvas.paste(img_small, (x, y))
+        cid = card_ids[i]
+        img = images[i].resize((W_SMALL, H_SMALL))
+        if cid is not None:
+            img = add_padding(img, padding=6)
+            frame = frame_esoteric if str(cid).startswith("3300") else frame_normal
+            img = apply_frame(img, frame.copy())
+        x = start_x_small + col * (W_SMALL + PADDING)
+        y = start_y_small + row * (H_SMALL + PADDING)
+        canvas.alpha_composite(img, (x, y))
 
     # 步骤5: 输出到 Buffer
     buffer = BytesIO()
