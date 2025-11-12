@@ -132,7 +132,8 @@ async def fetch_image(session: aiohttp.ClientSession, card_id: int, fallback: Im
     """
     cache_path = os.path.join(IMAGE_CACHE_DIR, f"{card_id}.png")
     if os.path.exists(cache_path):
-        return Image.open(cache_path)
+        # 确保返回 RGBA 模式的图片副本
+        return Image.open(cache_path).convert("RGBA")
 
     url = f"https://static-data.7shengzhaohuan.online/api/v4/image/{card_id}?thumbnail=true"
     try:
@@ -141,7 +142,7 @@ async def fetch_image(session: aiohttp.ClientSession, card_id: int, fallback: Im
                 image_data = await response.read()
                 with open(cache_path, "wb") as f:
                     f.write(image_data)
-                return Image.open(BytesIO(image_data))
+                return Image.open(BytesIO(image_data)).convert("RGBA")
             else:
                 # 如果下载失败，返回一个占位图
                 print(f"警告：无法下载卡牌图片 ID: {card_id}, 状态码: {response.status}")
@@ -156,8 +157,10 @@ def add_padding(img: Image.Image, padding: int = 4) -> Image.Image:
     return new_img
 
 def apply_frame(base_img: Image.Image, frame: Image.Image) -> Image.Image:
-    base_img = base_img.convert("RGBA")
-    return Image.alpha_composite(base_img, frame)
+    # 确保两张图为 RGBA 并且尺寸一致后合成，避免 "images do not match" 错误
+    base = base_img.convert("RGBA")
+    frame_resized = frame.convert("RGBA").resize(base.size, Image.Resampling.LANCZOS)
+    return Image.alpha_composite(base, frame_resized)
 
 # --- 4 & 5. 核心逻辑：图片合成与输出 ---
 
